@@ -638,7 +638,7 @@ impl Router {
                 worker.clone(),
                 worker_url.to_string(),
             );
-            if !status.is_server_error() {
+            if status.is_server_error() {
                 tracked.mark_errored();
             }
             let body = Body::from_stream(tracked);
