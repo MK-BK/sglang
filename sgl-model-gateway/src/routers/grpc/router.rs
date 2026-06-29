@@ -23,8 +23,8 @@ use crate::{
     config::types::RetryConfig,
     core::{is_retryable_status, RetryExecutor, WorkerRegistry, UNKNOWN_MODEL_ID},
     observability::metrics::{metrics_labels, Metrics},
+    chat_ext::ChatCompletionRequestExt,
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -142,7 +142,7 @@ impl GrpcRouter {
     async fn route_chat_impl(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &ChatCompletionRequestExt,
         model_id: Option<&str>,
     ) -> Response {
         // Choose Harmony pipeline if workers indicate Harmony (checks architectures, hf_model_type)
@@ -162,7 +162,7 @@ impl GrpcRouter {
         };
 
         // Clone values needed for retry closure
-        let request = Arc::new(body.clone());
+        let request = Arc::new(body.inner.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
         let components = self.shared_components.clone();
@@ -386,7 +386,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &ChatCompletionRequestExt,
         model_id: Option<&str>,
     ) -> Response {
         self.route_chat_impl(headers, body, model_id).await

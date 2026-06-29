@@ -39,8 +39,8 @@ use crate::{
         metrics::{self, PrometheusConfig},
         otel_trace,
     },
+    chat_ext::ChatCompletionRequestExt,
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
@@ -184,7 +184,7 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedJson(body): ValidatedJson<ChatCompletionRequestExt>,
 ) -> Response {
     state
         .router

@@ -24,8 +24,8 @@ use crate::{
         otel_trace::inject_trace_context_http,
     },
     policies::{PolicyRegistry, SelectWorkerInfo},
+    chat_ext::ChatCompletionRequestExt,
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         common::GenerationRequest,
         completion::CompletionRequest,
@@ -321,7 +321,12 @@ impl Router {
         // mask "200-then-broken" workers — every request would tick a
         // success before the stream had a chance to error out.
         if !is_stream {
-            worker.record_outcome(status.is_success());
+            // 4xx (client error) is NOT a worker failure — the worker
+            // correctly rejected a malformed request.  Only 2xx ticks a
+            // success; 5xx ticks a failure.  This matches the PD router's
+            // `is_success() || is_client_error()` semantics.
+            let not_error = status.is_success() || status.is_client_error();
+            worker.record_outcome(not_error);
         }
 
         // Record worker errors for server errors (5xx)
@@ -622,17 +627,18 @@ impl Router {
             // no spawned task or channel needed. `BreakerTrackedStream`
             // updates the worker's circuit breaker exactly once on drop:
             // success on clean end, failure on stream error, neither on
-            // client disconnect. For non-2xx responses we pre-mark the
+            // client disconnect. For 5xx responses we pre-mark the
             // wrapper as Errored — otherwise the small error body would
             // stream cleanly to `None` and Drop would record a spurious
             // success (and the streaming branch also skips the eager
-            // `record_outcome` above).
+            // `record_outcome` above). 4xx (client error) is NOT a worker
+            // failure, so the wrapper stays clean.
             let mut tracked = BreakerTrackedStream::new(
                 res.bytes_stream(),
                 worker.clone(),
                 worker_url.to_string(),
             );
-            if !status.is_success() {
+            if !status.is_server_error() {
                 tracked.mark_errored();
             }
             let body = Body::from_stream(tracked);
@@ -759,7 +765,7 @@ impl RouterTrait for Router {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &ChatCompletionRequestExt,
         model_id: Option<&str>,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/chat/completions", model_id)

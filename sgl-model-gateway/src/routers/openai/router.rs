@@ -33,8 +33,8 @@ use crate::{
         RuntimeType, Worker, WorkerRegistry,
     },
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
+    chat_ext::ChatCompletionRequestExt,
     protocols::{
-        chat::ChatCompletionRequest,
         responses::{
             generate_id, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
             ResponsesGetParams, ResponsesRequest,
@@ -471,7 +471,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &ChatCompletionRequestExt,
         model_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
@@ -537,7 +537,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
 
         let mut ctx = RequestContext::for_chat(
-            Arc::new(body.clone()),
+            Arc::new(body.inner.clone()),
             headers.cloned(),
             model_id.map(String::from),
             ComponentRefs::Shared(self.shared_components()),
@@ -600,13 +600,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     if !is_streaming {
                         // Non-streaming: record the breaker outcome inline
                         // once the body is fully read.
-                        if !status.is_success() {
+                        // 4xx (client error) is NOT a worker failure — only
+                        // record failure on 5xx (server error).
+                        if status.is_server_error() {
                             worker.circuit_breaker().record_failure();
                         }
                         let content_type = resp.headers().get(CONTENT_TYPE).cloned();
                         match resp.bytes().await {
                             Ok(body) => {
-                                if status.is_success() {
+                                if !status.is_server_error() {
                                     worker.circuit_breaker().record_success();
                                 }
                                 let mut response = Response::new(Body::from(body));
@@ -630,16 +632,17 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         // through `BreakerTrackedStream`, which records the
                         // circuit-breaker outcome exactly once on drop (success
                         // on clean end, failure on stream error, neither on
-                        // client disconnect). For non-2xx responses we pre-mark
+                        // client disconnect). For 5xx responses we pre-mark
                         // the wrapper as Errored — otherwise the small error
                         // body would stream cleanly to `None` and Drop would
-                        // record a spurious success.
+                        // record a spurious success. 4xx (client error) is
+                        // NOT a worker failure, so the wrapper stays clean.
                         let mut tracked = BreakerTrackedStream::new(
                             resp.bytes_stream(),
                             Arc::clone(&worker),
                             url.clone(),
                         );
-                        if !status.is_success() {
+                        if !status.is_server_error() {
                             tracked.mark_errored();
                         }
                         let mut response = Response::new(Body::from_stream(tracked));

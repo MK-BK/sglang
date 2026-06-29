@@ -28,8 +28,8 @@ use crate::{
         otel_trace::inject_trace_context_http,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    chat_ext::ChatCompletionRequestExt,
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         common::{GenerationRequest, InputIds, StringOrArray},
         completion::CompletionRequest,
@@ -202,7 +202,7 @@ impl PDRouter {
         None
     }
 
-    fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
+    fn get_chat_batch_size(req: &ChatCompletionRequestExt) -> Option<usize> {
         if let Some(n) = req.n {
             if n > 1 {
                 return Some(n as usize);
@@ -800,7 +800,7 @@ impl PDRouter {
     ///
     /// Returns `None` when the conversation has no text to route on, preserving
     /// the prior behavior of not feeding an empty key into prefix matching.
-    fn build_chat_request_text(body: &ChatCompletionRequest) -> Option<String> {
+    fn build_chat_request_text(body: &ChatCompletionRequestExt) -> Option<String> {
         // `extract_text_for_routing` walks every message (system, prior turns,
         // current message, tool content) and is the same routing text the regular
         // (non-PD) router uses, keeping cache-aware routing consistent across both.
@@ -1437,7 +1437,7 @@ impl RouterTrait for PDRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &ChatCompletionRequestExt,
         model_id: Option<&str>,
     ) -> Response {
         let is_stream = body.stream;
@@ -1592,7 +1592,7 @@ mod tests {
         // Cache-aware routing must build its text from the full conversation, not
         // just the first message, so that KV-cache prefix matching reflects what
         // the worker will actually process in a multi-turn chat.
-        let body: ChatCompletionRequest = serde_json::from_value(json!({
+        let body: ChatCompletionRequestExt = serde_json::from_value(json!({
             "model": "test-model",
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},

@@ -1,5 +1,6 @@
 pub mod app_context;
 pub use smg_auth as auth;
+pub mod chat_ext;
 pub mod config;
 pub mod core;
 pub mod middleware;
