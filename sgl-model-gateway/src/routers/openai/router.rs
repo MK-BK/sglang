@@ -642,7 +642,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             Arc::clone(&worker),
                             url.clone(),
                         );
-                        if !status.is_server_error() {
+                        if status.is_server_error() {
                             tracked.mark_errored();
                         }
                         let mut response = Response::new(Body::from_stream(tracked));
