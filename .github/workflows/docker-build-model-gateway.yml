@@ -116,7 +116,7 @@ jobs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
-    - name: 显示构建完成信息
+    - name: 显示镜像构建完成信息
       run: |
         echo ""
         echo "🎉 sgl-model-gateway镜像构建并推送完成！"
