@@ -4,21 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: '选择要构建的分支'
+        description: '构建分支名称'
         required: true
-        type: choice
-        options:
-          - main
-          - develop
-          - feature/kimi-adapt
-          - staging
-          - production
+        type: string
         default: 'develop'
       image_tag:
         description: '镜像标签 (如: v1.0.0, latest, prod-20241207)'
-        required: true
+        required: false
         type: string
-        default: 'latest'
+        default: ''
 
 env:
   REGISTRY: crpi-pweus896l7j9p1b9.cn-hangzhou.personal.cr.aliyuncs.com
