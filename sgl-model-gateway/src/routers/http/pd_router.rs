@@ -488,6 +488,7 @@ impl PDRouter {
                 error_stream,
                 status,
                 None,
+                None,  // No prefill body for error responses
                 context.return_logprob,
                 Some(response_headers),
                 prefill,
@@ -709,6 +710,7 @@ impl PDRouter {
                         res.bytes_stream(),
                         status,
                         prefill_logprobs,
+                        prefill_body,
                         context.return_logprob,
                         Some(response_headers),
                         prefill,
@@ -731,8 +733,15 @@ impl PDRouter {
 
                         match res.bytes().await {
                             Ok(decode_body) => {
-                                let mut response = Response::new(Body::from(decode_body));
-                                *response.status_mut() = status;
+                                // Even in streaming=false direct passthrough, we should process usage
+                                let processed_response = self.process_response_with_usage(
+                                    decode_body,
+                                    prefill_body,
+                                    status,
+                                ).await;
+                                
+                                // Preserve original headers
+                                let mut response = processed_response;
                                 *response.headers_mut() = response_headers;
                                 response
                             }
@@ -949,6 +958,7 @@ impl PDRouter {
         stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
         status: StatusCode,
         prefill_logprobs: Option<Value>,
+        prefill_body: Option<bytes::Bytes>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
@@ -992,7 +1002,13 @@ impl PDRouter {
                                     Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
                                         .unwrap_or(chunk)
                                 } else {
-                                    chunk
+                                    // For streaming responses, we need to add usage information to the final chunk
+                                    if is_done {
+                                        Self::inject_usage_in_streaming_chunk(prefill_body.as_ref(), &chunk)
+                                            .unwrap_or(chunk)
+                                    } else {
+                                        chunk
+                                    }
                                 };
 
                                 // Mark the wrapper completed before the client
@@ -1074,11 +1090,12 @@ impl PDRouter {
         };
 
         if !return_logprob {
-            return (status, decode_body).into_response();
+            // Even when not returning logprobs, we should still process usage information
+            return self.process_response_with_usage(decode_body, prefill_body, status).await;
         }
 
         let Some(prefill_body) = prefill_body else {
-            return (status, decode_body).into_response();
+            return self.process_response_with_usage(decode_body, None, status).await;
         };
 
         // Merge logprobs from prefill and decode
@@ -1087,18 +1104,95 @@ impl PDRouter {
             serde_json::from_slice::<Value>(&decode_body),
         ) else {
             warn!("Failed to parse responses for logprob merging");
-            return (status, decode_body).into_response();
+            return self.process_response_with_usage(decode_body, None, status).await;
         };
 
         Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
+        
+        // Also merge usage information
+        Self::merge_usage_in_json(&prefill_json, &mut decode_json);
 
         // Return merged response
         match serde_json::to_vec(&decode_json) {
             Ok(body) => (status, body).into_response(),
             Err(e) => {
                 error!("Failed to serialize merged response: {}", e);
+                self.process_response_with_usage(decode_body, None, status).await
+            }
+        }
+    }
+
+    // Helper to process response with usage information merging
+    async fn process_response_with_usage(
+        &self,
+        decode_body: bytes::Bytes,
+        prefill_body: Option<bytes::Bytes>,
+        status: StatusCode,
+    ) -> Response {
+        // Try to parse and enhance response with usage information
+        match serde_json::from_slice::<Value>(&decode_body) {
+            Ok(mut decode_json) => {
+                if let Some(prefill_bytes) = prefill_body {
+                    if let Ok(prefill_json) = serde_json::from_slice::<Value>(&prefill_bytes) {
+                        Self::merge_usage_in_json(&prefill_json, &mut decode_json);
+                    }
+                }
+                
+                match serde_json::to_vec(&decode_json) {
+                    Ok(body) => (status, body).into_response(),
+                    Err(e) => {
+                        error!("Failed to serialize response with usage: {}", e);
+                        (status, decode_body).into_response()
+                    }
+                }
+            }
+            Err(_) => {
+                // If we can't parse JSON, return original response
                 (status, decode_body).into_response()
             }
+        }
+    }
+
+    // Helper to merge usage information from prefill and decode responses
+    fn merge_usage_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
+        // Extract token counts from both responses
+        let (prefill_tokens, decode_tokens) = match (
+            prefill_json.pointer("/meta_info/num_input_tokens"),
+            decode_json.pointer("/meta_info/num_output_tokens"),
+        ) {
+            (Some(prefill), Some(decode)) => {
+                let prefill_count = prefill.as_u64().unwrap_or(0);
+                let decode_count = decode.as_u64().unwrap_or(0);
+                (prefill_count, decode_count)
+            }
+            _ => return false,
+        };
+
+        // Create usage object for OpenAI-compatible response
+        let usage = serde_json::json!({
+            "prompt_tokens": prefill_tokens,
+            "completion_tokens": decode_tokens,
+            "total_tokens": prefill_tokens + decode_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": prefill_json
+                    .pointer("/meta_info/cached_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": prefill_json
+                    .pointer("/meta_info/reasoning_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+            }
+        });
+
+        // Inject usage into response
+        if let Some(obj) = decode_json.as_object_mut() {
+            obj.insert("usage".to_string(), usage);
+            true
+        } else {
+            false
         }
     }
 
@@ -1292,6 +1386,67 @@ impl PDRouter {
             serde_json::to_string(&decode_json).unwrap_or_default()
         );
         Ok(bytes::Bytes::from(merged_str))
+    }
+
+    // Helper to inject usage information into the final streaming chunk before [DONE]
+    fn inject_usage_in_streaming_chunk(
+        prefill_body: Option<&bytes::Bytes>,
+        decode_chunk: &[u8],
+    ) -> Result<bytes::Bytes, ()> {
+        // Only process [DONE] chunks
+        let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
+        if !chunk_str.contains("[DONE]") {
+            return Err(());
+        }
+
+        // Try to extract usage from prefill and decode responses
+        let usage_data = if let Some(prefill_bytes) = prefill_body {
+            match serde_json::from_slice::<Value>(prefill_bytes) {
+                Ok(prefill_json) => {
+                    // Extract token information from prefill response
+                    if let Some(num_input_tokens) = prefill_json.pointer("/meta_info/num_input_tokens") {
+                        if let Some(input_count) = num_input_tokens.as_u64() {
+                            // Create a minimal usage object
+                            Some(serde_json::json!({
+                                "prompt_tokens": input_count,
+                                "completion_tokens": 0,  // Will be updated by decode worker
+                                "total_tokens": input_count,
+                                "prompt_tokens_details": {
+                                    "cached_tokens": prefill_json
+                                        .pointer("/meta_info/cached_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0)
+                                },
+                                "completion_tokens_details": {
+                                    "reasoning_tokens": prefill_json
+                                        .pointer("/meta_info/reasoning_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0)
+                                }
+                            }))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // If we have usage data, create a usage chunk before [DONE]
+        if let Some(usage) = usage_data {
+            let usage_chunk = format!("data: {}\n\n", serde_json::to_string(&usage).unwrap_or_default());
+            let mut result = usage_chunk.into_bytes();
+            result.extend_from_slice(decode_chunk);
+            Ok(bytes::Bytes::from(result))
+        } else {
+            // No usage data available, return original chunk
+            Ok(bytes::Bytes::from(decode_chunk.to_vec()))
+        }
     }
 }
 
@@ -1621,7 +1776,7 @@ mod tests {
         // When the conversation carries no text content, no routing text should
         // be produced (None) rather than an empty string, preserving the prior
         // PD behavior. See https://github.com/sgl-project/sglang/issues/26263.
-        let body: ChatCompletionRequest = serde_json::from_value(json!({
+        let body: ChatCompletionRequestExt = serde_json::from_value(json!({
             "model": "test-model",
             "messages": [
                 {"role": "user", "content": ""}
@@ -1633,6 +1788,52 @@ mod tests {
             PDRouter::build_chat_request_text(&body).is_none(),
             "empty conversation text should produce None, not Some(\"\")"
         );
+    }
+
+    #[test]
+    fn test_merge_usage_in_json() {
+        // Test usage merging from prefill and decode responses
+        let prefill_json = json!({
+            "meta_info": {
+                "num_input_tokens": 15,
+                "cached_tokens": 3,
+                "reasoning_tokens": 0
+            }
+        });
+
+        let mut decode_json = json!({
+            "id": "test-response",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "test-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello, world!"
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "meta_info": {
+                "num_output_tokens": 25
+            }
+        });
+
+        let success = PDRouter::merge_usage_in_json(&prefill_json, &mut decode_json);
+        assert!(success, "Usage merging should succeed");
+
+        // Verify usage field was added correctly
+        if let Some(usage) = decode_json.get("usage") {
+            assert_eq!(usage["prompt_tokens"], 15);
+            assert_eq!(usage["completion_tokens"], 25);
+            assert_eq!(usage["total_tokens"], 40);
+            assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 3);
+            assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 0);
+        } else {
+            panic!("Usage field should be present in response");
+        }
     }
 
     #[tokio::test]
@@ -1744,6 +1945,7 @@ mod tests {
                 stream.map(Ok),
                 StatusCode::OK,
                 None,
+                None,  // No prefill body in test
                 false,
                 None,
                 prefill_ref.clone(),
