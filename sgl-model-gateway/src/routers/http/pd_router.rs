@@ -1335,23 +1335,13 @@ impl PDRouter {
             return Err(error_response);
         }
 
-        // Read prefill body if needed for logprob merging
-        let prefill_body = if return_logprob {
-            match prefill_response.bytes().await {
-                Ok(body) => Some(body),
-                Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
-                    None
-                }
+        // Read prefill body - needed for logprob merging AND usage aggregation
+        let prefill_body = match prefill_response.bytes().await {
+            Ok(body) => Some(body),
+            Err(e) => {
+                warn!("Failed to read prefill response body: {}", e);
+                None
             }
-        } else {
-            // For non-logprob requests, just consume the response without storing
-            debug!("Consuming prefill response body (non-logprob request)");
-            match prefill_response.bytes().await {
-                Ok(_) => debug!("Prefill response consumed successfully"),
-                Err(e) => warn!("Error consuming prefill response: {}", e),
-            }
-            None
         };
 
         Ok((prefill_status, prefill_body))
