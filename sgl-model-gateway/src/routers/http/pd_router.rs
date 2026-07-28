@@ -1215,25 +1215,29 @@ impl PDRouter {
         tracing::info!("[PD DEBUG] Prefill response JSON: {}", prefill_json);
         tracing::info!("[PD DEBUG] Decode response JSON: {}", decode_json);
 
-        // Extract token counts from both responses
-        let (prefill_tokens, decode_tokens) = match (
-            prefill_json.pointer("/meta_info/num_input_tokens"),
-            decode_json.pointer("/meta_info/num_output_tokens"),
-        ) {
-            (Some(prefill), Some(decode)) => {
-                let prefill_count = prefill.as_u64().unwrap_or(0);
-                let decode_count = decode.as_u64().unwrap_or(0);
-                (prefill_count, decode_count)
-            }
-            _ => {
-                tracing::warn!("[PD DEBUG] Failed to extract token counts. Prefill has num_input_tokens: {}, Decode has num_output_tokens: {}", 
-                    prefill_json.pointer("/meta_info/num_input_tokens").is_some(),
-                    decode_json.pointer("/meta_info/num_output_tokens").is_some());
-                return false;
-            }
-        };
+        // Extract token counts - try meta_info first (old format), then usage (new format)
+        let prefill_tokens = prefill_json.pointer("/meta_info/num_input_tokens")
+            .or_else(|| prefill_json.pointer("/usage/prompt_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        
+        let decode_tokens = decode_json.pointer("/meta_info/num_output_tokens")
+            .or_else(|| decode_json.pointer("/usage/completion_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
-        // Extract details for debug
+        if prefill_tokens == 0 && prefill_json.pointer("/usage/prompt_tokens").is_none() && prefill_json.pointer("/meta_info/num_input_tokens").is_none() {
+            tracing::warn!("[PD DEBUG] Failed to find prefill token count in either /meta_info/num_input_tokens or /usage/prompt_tokens");
+            return false;
+        }
+        
+        if decode_tokens == 0 && decode_json.pointer("/usage/completion_tokens").is_none() && decode_json.pointer("/meta_info/num_output_tokens").is_none() {
+            tracing::warn!("[PD DEBUG] Failed to find decode token count in either /meta_info/num_output_tokens or /usage/completion_tokens");
+            return false;
+        }
+
+        // Extract details for debug - check if meta_info exists for details
+        let has_meta_info = prefill_json.pointer("/meta_info").is_some();
         let cached_tokens = prefill_json
             .pointer("/meta_info/cached_tokens")
             .and_then(|v| v.as_u64())
@@ -1244,8 +1248,8 @@ impl PDRouter {
             .unwrap_or(0);
         
         tracing::info!(
-            "[PD DEBUG] Extracted details - cached_tokens: {}, reasoning_tokens: {}", 
-            cached_tokens, reasoning_tokens
+            "[PD DEBUG] meta_info exists: {}, cached_tokens: {}, reasoning_tokens: {}", 
+            has_meta_info, cached_tokens, reasoning_tokens
         );
 
         // Create usage object for OpenAI-compatible response
@@ -1478,13 +1482,12 @@ impl PDRouter {
                     tracing::debug!(
                         "[PD InjectUsage] Parsed prefill JSON for usage: {}",
                         prefill_json
-                    );
-                    // Extract token information from prefill response
-                    if let Some(num_input_tokens) =
-                        prefill_json.pointer("/meta_info/num_input_tokens")
+                    );                    // Extract token information from prefill response (try meta_info first, then usage)
+                    if let Some(num_input_tokens) = prefill_json.pointer("/meta_info/num_input_tokens")
+                        .or_else(|| prefill_json.pointer("/usage/prompt_tokens"))
                     {
                         if let Some(input_count) = num_input_tokens.as_u64() {
-                            tracing::info!(
+                                                        tracing::info!(
                                 "[PD InjectUsage] Creating usage object - prompt_tokens={}",
                                 input_count
                             );
