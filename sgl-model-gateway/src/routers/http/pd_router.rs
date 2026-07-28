@@ -17,6 +17,7 @@ use tracing::{debug, error, warn};
 
 use super::pd_types::api_path;
 use crate::{
+    chat_ext::ChatCompletionRequestExt,
     config::types::RetryConfig,
     core::{
         is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
@@ -28,7 +29,6 @@ use crate::{
         otel_trace::inject_trace_context_http,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
-    chat_ext::ChatCompletionRequestExt,
     protocols::{
         classify::ClassifyRequest,
         common::{GenerationRequest, InputIds, StringOrArray},
@@ -488,7 +488,7 @@ impl PDRouter {
                 error_stream,
                 status,
                 None,
-                None,  // No prefill body for error responses
+                None, // No prefill body for error responses
                 context.return_logprob,
                 Some(response_headers),
                 prefill,
@@ -693,6 +693,11 @@ impl PDRouter {
 
                 if context.is_stream {
                     // Streaming response
+                    tracing::info!(
+                        "[PD Dispatcher] Processing STREAMING response - prefill={}, decode={}",
+                        prefill.url(),
+                        decode.url()
+                    );
                     let prefill_logprobs = if context.return_logprob {
                         prefill_body
                             .as_ref()
@@ -718,6 +723,11 @@ impl PDRouter {
                     )
                 } else {
                     // Non-streaming response
+                    tracing::info!(
+                        "[PD Dispatcher] Processing NON-STREAMING response - prefill={}, decode={}",
+                        prefill.url(),
+                        decode.url()
+                    );
                     if context.return_logprob {
                         self.process_non_streaming_response(
                             res,
@@ -733,13 +743,16 @@ impl PDRouter {
 
                         match res.bytes().await {
                             Ok(decode_body) => {
+                                tracing::info!(
+                                    "[PD Dispatcher] Calling process_response_with_usage for non-streaming - decode_body_len={}, has_prefill={}",
+                                    decode_body.len(),
+                                    prefill_body.is_some()
+                                );
                                 // Even in streaming=false direct passthrough, we should process usage
-                                let processed_response = self.process_response_with_usage(
-                                    decode_body,
-                                    prefill_body,
-                                    status,
-                                ).await;
-                                
+                                let processed_response = self
+                                    .process_response_with_usage(decode_body, prefill_body, status)
+                                    .await;
+
                                 // Preserve original headers
                                 let mut response = processed_response;
                                 *response.headers_mut() = response_headers;
@@ -966,6 +979,9 @@ impl PDRouter {
     ) -> Response {
         use crate::core::AttachedBody;
 
+        tracing::info!("[PD Streaming] Creating streaming response - has_prefill_logprobs={}, has_prefill_body={}, return_logprob={}", 
+            prefill_logprobs.is_some(), prefill_body.is_some(), return_logprob);
+
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Uses select! to race stream.next() against tx.closed() so that
@@ -1002,13 +1018,21 @@ impl PDRouter {
                                     Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
                                         .unwrap_or(chunk)
                                 } else {
-                                    // For streaming responses, we need to add usage information to the final chunk
-                                    if is_done {
-                                        Self::inject_usage_in_streaming_chunk(prefill_body.as_ref(), &chunk)
-                                            .unwrap_or(chunk)
-                                    } else {
-                                        chunk
-                                    }
+                                // For streaming responses, we need to add usage information to the final chunk
+                                if is_done {
+                                    tracing::info!("[PD Streaming] Injecting usage into final chunk before [DONE]");
+                                    Self::inject_usage_in_streaming_chunk(prefill_body.as_ref(), &chunk)
+                                        .map(|result| {
+                                            tracing::info!("[PD Streaming] Usage injection successful, result_len={}", result.len());
+                                            result
+                                        })
+                                        .unwrap_or_else(|e| {
+                                            tracing::warn!("[PD Streaming] Usage injection failed: {:?}, using original chunk", e);
+                                            chunk
+                                        })
+                                } else {
+                                    chunk
+                                }
                                 };
 
                                 // Mark the wrapper completed before the client
@@ -1091,11 +1115,15 @@ impl PDRouter {
 
         if !return_logprob {
             // Even when not returning logprobs, we should still process usage information
-            return self.process_response_with_usage(decode_body, prefill_body, status).await;
+            return self
+                .process_response_with_usage(decode_body, prefill_body, status)
+                .await;
         }
 
         let Some(prefill_body) = prefill_body else {
-            return self.process_response_with_usage(decode_body, None, status).await;
+            return self
+                .process_response_with_usage(decode_body, None, status)
+                .await;
         };
 
         // Merge logprobs from prefill and decode
@@ -1104,11 +1132,13 @@ impl PDRouter {
             serde_json::from_slice::<Value>(&decode_body),
         ) else {
             warn!("Failed to parse responses for logprob merging");
-            return self.process_response_with_usage(decode_body, None, status).await;
+            return self
+                .process_response_with_usage(decode_body, None, status)
+                .await;
         };
 
         Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
-        
+
         // Also merge usage information
         Self::merge_usage_in_json(&prefill_json, &mut decode_json);
 
@@ -1117,7 +1147,8 @@ impl PDRouter {
             Ok(body) => (status, body).into_response(),
             Err(e) => {
                 error!("Failed to serialize merged response: {}", e);
-                self.process_response_with_usage(decode_body, None, status).await
+                self.process_response_with_usage(decode_body, None, status)
+                    .await
             }
         }
     }
@@ -1129,24 +1160,49 @@ impl PDRouter {
         prefill_body: Option<bytes::Bytes>,
         status: StatusCode,
     ) -> Response {
+        tracing::info!("[PD Usage] Processing response with usage - decode_body_len={}, has_prefill={}, status={}", 
+            decode_body.len(), prefill_body.is_some(), status);
+
         // Try to parse and enhance response with usage information
         match serde_json::from_slice::<Value>(&decode_body) {
             Ok(mut decode_json) => {
+                tracing::debug!(
+                    "[PD Usage] Successfully parsed decode JSON: {}",
+                    decode_json
+                );
+
                 if let Some(prefill_bytes) = prefill_body {
+                    tracing::debug!(
+                        "[PD Usage] Parsing prefill bytes (len={})",
+                        prefill_bytes.len()
+                    );
                     if let Ok(prefill_json) = serde_json::from_slice::<Value>(&prefill_bytes) {
+                        tracing::debug!("[PD Usage] Successfully parsed prefill JSON, calling merge_usage_in_json");
                         Self::merge_usage_in_json(&prefill_json, &mut decode_json);
+                    } else {
+                        tracing::warn!("[PD Usage] Failed to parse prefill JSON bytes");
                     }
+                } else {
+                    tracing::info!("[PD Usage] No prefill body provided");
                 }
-                
+
                 match serde_json::to_vec(&decode_json) {
-                    Ok(body) => (status, body).into_response(),
+                    Ok(body) => {
+                        tracing::info!("[PD Usage] Successfully serialized merged response with usage, body_len={}", body.len());
+                        (status, body).into_response()
+                    }
                     Err(e) => {
-                        error!("Failed to serialize response with usage: {}", e);
+                        error!("[PD Usage] Failed to serialize response with usage: {}", e);
                         (status, decode_body).into_response()
                     }
                 }
             }
-            Err(_) => {
+            Err(e) => {
+                tracing::warn!(
+                    "[PD Usage] Failed to parse decode JSON: {}, body sample: {:?}",
+                    e,
+                    String::from_utf8_lossy(&decode_body[..std::cmp::min(200, decode_body.len())])
+                );
                 // If we can't parse JSON, return original response
                 (status, decode_body).into_response()
             }
@@ -1155,6 +1211,10 @@ impl PDRouter {
 
     // Helper to merge usage information from prefill and decode responses
     fn merge_usage_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
+        // Debug: print prefill response structure
+        tracing::info!("[PD DEBUG] Prefill response JSON: {}", prefill_json);
+        tracing::info!("[PD DEBUG] Decode response JSON: {}", decode_json);
+
         // Extract token counts from both responses
         let (prefill_tokens, decode_tokens) = match (
             prefill_json.pointer("/meta_info/num_input_tokens"),
@@ -1165,7 +1225,12 @@ impl PDRouter {
                 let decode_count = decode.as_u64().unwrap_or(0);
                 (prefill_count, decode_count)
             }
-            _ => return false,
+            _ => {
+                tracing::warn!("[PD DEBUG] Failed to extract token counts. Prefill has num_input_tokens: {}, Decode has num_output_tokens: {}", 
+                    prefill_json.pointer("/meta_info/num_input_tokens").is_some(),
+                    decode_json.pointer("/meta_info/num_output_tokens").is_some());
+                return false;
+            }
         };
 
         // Create usage object for OpenAI-compatible response
@@ -1396,21 +1461,39 @@ impl PDRouter {
         // Only process [DONE] chunks
         let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
         if !chunk_str.contains("[DONE]") {
+            tracing::debug!("[PD InjectUsage] Skipping chunk (no [DONE])");
             return Err(());
         }
 
+        tracing::info!(
+            "[PD InjectUsage] Processing [DONE] chunk - has_prefill={}, chunk_len={}",
+            prefill_body.is_some(),
+            decode_chunk.len()
+        );
+
         // Try to extract usage from prefill and decode responses
         let usage_data = if let Some(prefill_bytes) = prefill_body {
+            tracing::debug!("[PD InjectUsage] Attempting to parse prefill bytes for usage");
             match serde_json::from_slice::<Value>(prefill_bytes) {
                 Ok(prefill_json) => {
+                    tracing::debug!(
+                        "[PD InjectUsage] Parsed prefill JSON for usage: {}",
+                        prefill_json
+                    );
                     // Extract token information from prefill response
-                    if let Some(num_input_tokens) = prefill_json.pointer("/meta_info/num_input_tokens") {
+                    if let Some(num_input_tokens) =
+                        prefill_json.pointer("/meta_info/num_input_tokens")
+                    {
                         if let Some(input_count) = num_input_tokens.as_u64() {
+                            tracing::info!(
+                                "[PD InjectUsage] Creating usage object - prompt_tokens={}",
+                                input_count
+                            );
                             // Create a minimal usage object
                             Some(serde_json::json!({
                                 "prompt_tokens": input_count,
                                 "completion_tokens": 0,  // Will be updated by decode worker
-                                "total_tokens": input_count,
+                                 "total_tokens": input_count,
                                 "prompt_tokens_details": {
                                     "cached_tokens": prefill_json
                                         .pointer("/meta_info/cached_tokens")
@@ -1425,21 +1508,35 @@ impl PDRouter {
                                 }
                             }))
                         } else {
+                            tracing::warn!("[PD InjectUsage] Failed to get input_count from num_input_tokens: {:?}", num_input_tokens);
                             None
                         }
                     } else {
+                        tracing::warn!(
+                            "[PD InjectUsage] num_input_tokens not found in prefill response"
+                        );
                         None
                     }
                 }
-                Err(_) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        "[PD InjectUsage] Failed to parse prefill bytes for usage: {}",
+                        e
+                    );
+                    None
+                }
             }
         } else {
+            tracing::info!("[PD InjectUsage] No prefill body available for usage");
             None
         };
 
         // If we have usage data, create a usage chunk before [DONE]
         if let Some(usage) = usage_data {
-            let usage_chunk = format!("data: {}\n\n", serde_json::to_string(&usage).unwrap_or_default());
+            let usage_chunk = format!(
+                "data: {}\n\n",
+                serde_json::to_string(&usage).unwrap_or_default()
+            );
             let mut result = usage_chunk.into_bytes();
             result.extend_from_slice(decode_chunk);
             Ok(bytes::Bytes::from(result))
@@ -1945,7 +2042,7 @@ mod tests {
                 stream.map(Ok),
                 StatusCode::OK,
                 None,
-                None,  // No prefill body in test
+                None, // No prefill body in test
                 false,
                 None,
                 prefill_ref.clone(),
