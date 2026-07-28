@@ -16,7 +16,7 @@ on:
 
 env:
   REGISTRY: crpi-pweus896l7j9p1b9.cn-hangzhou.personal.cr.aliyuncs.com
-  IMAGE_NAME: sgl-model-gateway
+  IMAGE_NAME: images_dev/sgl-model-gateway
   DOCKERFILE_PATH: ./docker/gateway.Dockerfile
 
 jobs:
